@@ -1,0 +1,440 @@
+# n8n Lead Qualification — Main Workflow + Subflow (Export + README)
+
+This document contains:
+
+1. **Main n8n workflow** (JSON export) — triggers on webhook or Gmail, orchestrates parsing, calls the Lead Categorization subflow, writes to Google Sheet (CRM), optionally creates CRM entry, sends email, posts Slack message, and has simple error handling.
+2. **Subflow: Lead Categorization** (JSON export) — reusable workflow that takes `message` text and returns `category` and `confidence`.
+3. **README** — instructions to import, configure credentials, test payloads, Google Sheet schema, Gmail templates, Slack format, and a short demo script for recording your 2–5 minute video.
+
+---
+
+## IMPORTANT
+
+* These JSON exports are **best-effort, import-ready** templates for n8n. Depending on your n8n version and installed nodes, you may need to adjust node types or credentials (for example Gmail, Google Sheets, Slack, HubSpot nodes require credentials).
+* Replace placeholder credential names and API keys (e.g., `OPENAI_API_KEY`, `GMAIL_CREDENTIAL`, `GOOGLE_SHEETS_CREDENTIAL`, `SLACK_CREDENTIAL`) with your own when importing.
+
+---
+
+## 1) Main workflow (JSON)
+
+```json
+{
+  "name": "Lead Qualification - Main",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "lead-webhook",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "responseData": "={{{ {"success": true, "message": "Received"} }}}"
+      },
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 250]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "read",
+        "returnAll": true,
+        "filters": {}
+      },
+      "name": "Gmail Trigger (optional)",
+      "type": "n8n-nodes-base.googleGmailTrigger",
+      "typeVersion": 1,
+      "position": [50, 250]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse incoming payload (supports webhook or Gmail)
+const payload = $input.all()[0].json;
+// Expect either {from, subject, text, html} (webhook) or Gmail format
+let text = '';
+if (payload.text) text = payload.text;
+else if (payload.snippet) text = payload.snippet;
+else if (payload.body) text = payload.body;
+
+// simple regexes for name/company/email from body or subject
+const emailMatch = (payload.from || payload.headers?.From || '').match(/<?([^>\s]+@[^>\s]+)>?/);
+const email = emailMatch ? emailMatch[1] : (payload.email || null);
+
+const nameMatch = (payload.from || '').match(/^(?:\"?([^\"<]+)\"?)?/);
+const name = nameMatch && nameMatch[1] ? nameMatch[1].trim() : (payload.name || '');
+
+// attempt to extract company via heuristics — look for "Company: XYZ" or "from XYZ"
+let company = null;
+const companyRegex = /Company\s*[:\-]\s*(.+)/i;
+const companyMatch = (payload.text || payload.body || payload.snippet || '').match(companyRegex);
+if (companyMatch) company = companyMatch[1].split('\n')[0].trim();
+
+return [{ json: {
+  name,
+  email,
+  company,
+  message: text || payload.snippet || payload.body || payload.html || '',
+  original: payload
+}}];"
+      },
+      "name": "Parse Lead Details",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 250]
+    },
+    {
+      "parameters": {
+        "workflowId": "Lead Categorization - Subflow",
+        "inputData": [
+          {
+            "key": "message",
+            "value": "={{$json[\"message\"]}}"
+          }
+        ]
+      },
+      "name": "Run Lead Categorization Subflow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [650, 250]
+    },
+    {
+      "parameters": {
+        "functionCode": "// normalize subflow output into main flow
+const cat = $input.item.json; // assume category & confidence
+return [{ json: {
+  name: $items("Parse Lead Details")[0].json.name,
+  email: $items("Parse Lead Details")[0].json.email,
+  company: $items("Parse Lead Details")[0].json.company,
+  message: $items("Parse Lead Details")[0].json.message,
+  category: cat.category || cat.result || 'Unknown',
+  confidence: cat.confidence || 0
+}}];"
+      },
+      "name": "Normalize Categorization",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [850, 250]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "sheetId": "<GOOGLE_SHEET_ID>",
+        "range": "Leads!A1",
+        "options": {},
+        "valueInputMode": "USER_ENTERED",
+        "data": [
+          {
+            "json": {
+              "Name": "={{$json.name}}",
+              "Email": "={{$json.email}}",
+              "Company": "={{$json.company}}",
+              "Message": "={{$json.message}}",
+              "Category": "={{$json.category}}",
+              "Confidence": "={{$json.confidence}}",
+              "ReceivedAt": "={{new Date().toISOString()}}"
+            }
+          }
+        ]
+      },
+      "name": "Append to Google Sheet (CRM)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [1050, 150]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "resource": "deal",
+        "additionalFields": {
+          "title": "={{$json.name || $json.email}} - Lead",
+          "value": 0,
+          "notes": "={{$json.message}}",
+          "org": "={{$json.company}}"
+        }
+      },
+      "name": "Create CRM Entry (Pipedrive placeholder)",
+      "type": "n8n-nodes-base.pipedrive",
+      "typeVersion": 1,
+      "position": [1050, 350]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Branch on category
+if ($json.category === 'High Intent') {
+  return [{ json: { action: 'create_crm' } }];
+}
+return [{ json: { action: 'reply_email' } }];"
+      },
+      "name": "Decide Next Action",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [950, 450]
+    },
+    {
+      "parameters": {
+        "to": "={{$json.email}}",
+        "subject": "Thanks for reaching out — let’s schedule a demo",
+        "text": "Hi {{$json.name || 'there'}},\n\nThanks for contacting us. I'd love to show you our product — are you available for a 30 minute demo? Please pick a time: <CALENDAR_LINK>\n\nBest,\nSales Team"
+      },
+      "name": "Send Automated Reply (Gmail)",
+      "type": "n8n-nodes-base.googleGmail",
+      "typeVersion": 1,
+      "position": [1250, 450]
+    },
+    {
+      "parameters": {
+        "channel": "#sales",
+        "text": "={{`New lead: ${$json.name || 'N/A'} (${ $json.email || 'N/A'}) — Category: ${$json.category} (conf:${$json.confidence}) — Company: ${$json.company || 'N/A'}`}}"
+      },
+      "name": "Slack Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [1250, 250]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Simple error handler — will be used in a catch node
+return [{ json: { error: true, details: $json }}];"
+      },
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1250, 50]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Lead Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Trigger (optional)": {
+      "main": [
+        [
+          {
+            "node": "Parse Lead Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Lead Details": {
+      "main": [
+        [
+          {
+            "node": "Run Lead Categorization Subflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Lead Categorization Subflow": {
+      "main": [
+        [
+          {
+            "node": "Normalize Categorization",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Categorization": {
+      "main": [
+        [
+          {
+            "node": "Append to Google Sheet (CRM)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Decide Next Action",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Slack Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Next Action": {
+      "main": [
+        [
+          {
+            "node": "Create CRM Entry (Pipedrive placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Automated Reply (Gmail)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false
+}
+```
+
+> **Notes**:
+>
+> * The main workflow demonstrates webhook + Gmail trigger options — you can enable one or both. The Webhook trigger allows manual testing via `curl` or Postman.
+> * The `ExecuteWorkflow` node points to the subflow by workflow name; in n8n you can select the sub-workflow in that node's `workflowId` parameter.
+
+---
+
+## 2) Subflow: Lead Categorization (JSON)
+
+This subflow expects input named `message` and returns JSON with `category` (High Intent / Medium Intent / Low Intent) and `confidence` (0-1 float).
+
+```json
+{
+  "name": "Lead Categorization - Subflow",
+  "nodes": [
+    {
+      "parameters": {
+        "functionCode": "// Input: $json.message\n// Simple rules-first fallback, then call OpenAI if available\nconst msg = $json.message || '';
+// quick keyword scoring
+let score = 0;
+const highKeywords = ['buy', 'purchase', 'pricing', 'price', 'contract', 'subscribe', 'urgent', 'demo', 'purchase decision', 'budget'];
+const medKeywords = ['interested', 'evaluate', 'trial', 'pilot', 'consider', 'looking for'];
+for (const k of highKeywords) if (msg.toLowerCase().includes(k)) score += 2;
+for (const k of medKeywords) if (msg.toLowerCase().includes(k)) score += 1;
+
+// normalize
+let category = 'Low Intent';
+if (score >= 4) category = 'High Intent';
+else if (score >= 2) category = 'Medium Intent';
+
+// default confidence based on score
+let confidence = Math.min(0.9, 0.2 + score * 0.15);
+
+return [{ json: { category, confidence, source: 'rules' } }];"
+      },
+      "name": "Rules-based Categorizer",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 250]
+    }
+  ],
+  "connections": {},
+  "active": false
+}
+```
+
+> **Optional (better)**: replace the `Rules-based Categorizer` with an **HTTP Request** node to call OpenAI's `gpt-4o-mini` or other LLM. If you do so, send a prompt like:
+>
+> "Categorize the following lead message into High Intent, Medium Intent, or Low Intent. Provide a single JSON object with fields `category` and `confidence` (0-1). Message: <MESSAGE>"
+>
+> Then parse the JSON response and return it from the subflow. This costs tokens but improves accuracy.
+
+---
+
+## 3) README — Importing & Configuration
+
+### Importing
+
+1. In n8n, go to **Workflows → Import** and paste each JSON into the import dialog. Import the subflow first, then the main workflow.
+2. After import, open **Credentials** and create credentials for:
+
+   * Google (Gmail & Google Sheets)
+   * Slack
+   * (Optional) Pipedrive/HubSpot if creating CRM entries there
+   * OpenAI (if using LLM)
+
+### Google Sheet schema (sheet named `Leads`)
+
+Columns (row 1 headers):
+`Name | Email | Company | Message | Category | Confidence | ReceivedAt`
+
+### Webhook manual test
+
+Use `curl` against the webhook URL given by the **Webhook Trigger** node after you activate the workflow. Example payload:
+
+```bash
+curl -X POST <WEBHOOK_URL> -H 'Content-Type: application/json' -d '{
+  "from": "Jane Doe <jane@example.com>",
+  "subject": "Interested in pricing",
+  "text": "Hi — we have a $50k budget and want a demo next week.\nCompany: ACME Corp"
+}'
+```
+
+The flow should parse, categorize, append to Google Sheets, send Slack notification, and — because the message contains 'budget' and 'demo' — classify as **High Intent** and create CRM entry.
+
+### Gmail trigger test
+
+Send an email to the connected Gmail account (subject: `Test lead`) and make sure the Gmail trigger is configured (label/filter or watch).
+
+### Video demo script (2–5 mins)
+
+1. Quick intro (10s): "This is Ashok (or your name). I'll demo the Lead Qualification n8n workflow."
+2. Show imported workflows list (10s).
+3. Show subflow (Lead Categorization) — explain rules or OpenAI usage (20s).
+4. Trigger the main flow with webhook `curl` or by sending a Gmail email containing a high-intent phrase (30–90s) — show it running and show Google Sheet row appended.
+5. Show Slack message and CRM entry (20–30s).
+6. Briefly summarize error handling & retry logic and how to adapt (20s).
+7. Share link to the recording location (Drive/YouTube) and close.
+
+---
+
+## 4) Error handling & retry suggestions
+
+* Use a **Catch Error** node connected to key nodes (HTTP Request, Google Sheets, CRM create). On error, send an alert to a Slack admin channel and append an error row in a separate sheet `Errors` with `error`, `node`, `payload`, `timestamp`.
+* For retry logic, enable the node-level retry/backoff where available (n8n supports `Retry` on some nodes) or implement a small re-queue: when a node fails, write the payload to a Google Sheet `RetryQueue` and have a scheduled workflow that re-processes `RetryQueue` items.
+
+---
+
+## 5) Templates & example prompts
+
+**OpenAI prompt for categorization (if used):**
+
+```
+You are a sales-intent classifier. Given the customer message, return JSON ONLY with keys: category (High Intent|Medium Intent|Low Intent) and confidence (0-1).
+Message: "<INSERT MESSAGE>"
+```
+
+**Automated reply email template:**
+
+```
+Subject: Thanks for reaching out — let's schedule a demo
+
+Hi {{name}},
+
+Thanks for contacting us. I'd love to show you our product — are you available for a 30 minute demo? Please pick a time here: <CALENDAR_LINK>
+
+Best,
+Sales Team
+```
+
+---
+
+## 6) Deliverables checklist (what to upload)
+
+* `main_workflow.json` (importable n8n JSON)
+* `lead_categorization_subflow.json` (importable)
+* Demo video (2–5 minutes) uploaded to Drive/YouTube — include link in your submission
+* A short README describing credentials and test steps (this file)
+
+---
+
+If you'd like, I can:
+
+* Produce **actual downloadable .json files** (I can paste full JSON here or generate them in the canvas). ✅
+* Expand the subflow to call OpenAI with example HTTP Request node configuration (show request body / headers). ✅
+* Provide exact `curl` commands and step-by-step screenshots (if you want a guide for the video). ✅
+
+Tell me which of the above you'd like next and I will add it directly into this document.
